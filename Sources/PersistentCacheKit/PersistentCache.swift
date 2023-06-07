@@ -3,17 +3,30 @@ import Foundation
 	import UIKit
 #endif
 
-public protocol CacheStorage: class {
-	subscript(_: String) -> Data? { get set }
+public struct CacheData {
+    let key: String
+    let data: Data?
+    var fts: [FTSIndexingColumns]
+}
+
+public protocol FTSRepresenting {
+    func indices() -> [FTSIndexingColumns]
+}
+
+public protocol CacheStorage: AnyObject {
+	subscript(_: String) -> CacheData? { get set }
 	/// Wait until all operations have been completed and data has been saved.
 	func sync()
+    /*func batch(insert values: [CacheData])*/
+    func search(q: FTSIndexingColumns) -> [Data]
+    func search(q: FTSIndexingColumns) -> [String]
 }
 
 extension CacheStorage {
 	func sync() {}
 }
 
-public struct Item<Value: Codable>: Codable {
+public struct Item<Value: Codable & FTSRepresenting>: Codable, FTSRepresenting {
 	public var expiration: Date?
 	public var value: Value
 	
@@ -33,9 +46,13 @@ public struct Item<Value: Codable>: Codable {
 	public init(_ value: Value, expiresIn: TimeInterval) {
 		self.init(value, expiration: Date(timeIntervalSinceNow: expiresIn))
 	}
+    
+    public func indices() -> [FTSIndexingColumns] {
+        return self.value.indices()
+    }
 }
 
-public class PersistentCache<Key: CustomStringConvertible & Hashable, Value: Codable> {
+public class PersistentCache<Key: CustomStringConvertible & Hashable, Value: Codable & FTSRepresenting> {
 	private let queue = DispatchQueue(label: "Cache", attributes: .concurrent)
 	private var internalCache = [Key: Item<Value>]()
 	
@@ -95,7 +112,7 @@ public class PersistentCache<Key: CustomStringConvertible & Hashable, Value: Cod
 			return self.queue.sync {
 				if let item = self.internalCache[key] {
 					return item
-				} else if let data = self.storage?[self.stringKey(for: key)], let item = try? self.decoder.decode(Item<Value>.self, from: data) {
+                } else if let data = self.storage?[self.stringKey(for: key)]?.data, let item = try? self.decoder.decode(Item<Value>.self, from: data) {
 					return item
 				} else {
 					return nil
@@ -108,10 +125,31 @@ public class PersistentCache<Key: CustomStringConvertible & Hashable, Value: Cod
 			self.queue.async(flags: .barrier) {
 				self.internalCache[key] = newValue
 				
-				self.storage?[self.stringKey(for: key)] = data
+                self.storage?[self.stringKey(for: key)] = CacheData(key: self.stringKey(for: key), data: data, fts: newValue?.indices() ?? [])
 			}
 		}
 	}
+    
+    public func search(q: FTSIndexingColumns) -> [Item<Value>] {
+        return self.queue.sync {
+            guard let result: [Data] = self.storage?.search(q: q) else { return [] }
+            
+            var items: [Item<Value>] = []
+            for data in result {
+                guard let item = try? self.decoder.decode(Item<Value>.self, from: data) else { continue }
+                items.append(item)
+            }
+            
+            return items
+        }
+    }
+    
+    public func search(q: FTSIndexingColumns) -> [String] {
+        return self.queue.sync {
+            guard let result: [String] = self.storage?.search(q: q) else { return [] }
+            return result
+        }
+    }
 	
 	/// Find a value or generate it if one doesn't exist.
 	///
@@ -137,7 +175,7 @@ public class PersistentCache<Key: CustomStringConvertible & Hashable, Value: Cod
 				completion(item.value)
 			} else {
 				self.queue.async {
-					if let data = self.storage?[self.stringKey(for: key)], let item = try? self.decoder.decode(Item<Value>.self, from: data) {
+                    if let data = self.storage?[self.stringKey(for: key)]?.data, let item = try? self.decoder.decode(Item<Value>.self, from: data) {
 						queue.async {
 							completion(item.value)
 						}
